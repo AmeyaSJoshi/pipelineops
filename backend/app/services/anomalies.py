@@ -9,7 +9,9 @@ STALE_DAYS = 14
 
 
 def detect_all_anomalies(db: Session) -> List[Dict[str, Any]]:
+    """Run all 12 anomaly detection rules and return combined results."""
     anomalies = []
+    # Rule 1-9: existing checks
     anomalies.extend(_check_missing_pay_rate(db))
     anomalies.extend(_check_stale_roles(db))
     anomalies.extend(_check_offer_no_amount(db))
@@ -19,6 +21,10 @@ def detect_all_anomalies(db: Session) -> List[Dict[str, Any]]:
     anomalies.extend(_check_duplicate_submissions(db))
     anomalies.extend(_check_offer_no_start_date(db))
     anomalies.extend(_check_role_status_conflict(db))
+    # Rule 10-12: new checks
+    anomalies.extend(_check_candidates_stuck_in_screen(db))
+    anomalies.extend(_check_recruiter_overload(db))
+    anomalies.extend(_check_rejected_without_reason(db))
     return anomalies
 
 
@@ -248,6 +254,109 @@ def _check_role_status_conflict(db: Session) -> List[Dict[str, Any]]:
                     "related_entity_id": role.id,
                     "status": "open",
                 })
+    return result
+
+
+def _check_candidates_stuck_in_screen(db: Session) -> List[Dict[str, Any]]:
+    """Rule 10: Candidates stuck in recruiter_screen for 10+ days with no forward movement."""
+    cutoff = datetime.utcnow() - timedelta(days=10)
+    apps = db.query(Application).filter(
+        Application.canonical_stage == "recruiter_screen",
+        Application.status == "active",
+        Application.last_activity_at < cutoff,
+    ).all()
+    result = []
+    for app in apps:
+        days = (datetime.utcnow() - app.last_activity_at).days if app.last_activity_at else 0
+        if days < 10:
+            continue
+        name = app.candidate.full_name if app.candidate else "Unknown"
+        title = app.job_role.title if app.job_role else "Unknown Role"
+        result.append({
+            "severity": "medium",
+            "category": "candidate_stuck_in_screen",
+            "title": f"{name} stuck in recruiter screen for {days} days on {title}",
+            "explanation": (
+                f"This candidate has been in the recruiter_screen stage for {days} days "
+                "with no forward movement. Prolonged screening delays reduce candidate experience "
+                "and risk losing strong candidates to other opportunities."
+            ),
+            "recommended_fix": "Advance, reject, or withdraw this candidate to keep the pipeline moving.",
+            "related_entity_type": "application",
+            "related_entity_id": app.id,
+            "status": "open",
+        })
+    return result
+
+
+def _check_recruiter_overload(db: Session) -> List[Dict[str, Any]]:
+    """Rule 11: Any recruiter assigned to 6+ open roles simultaneously."""
+    OVERLOAD_THRESHOLD = 6
+    roles = db.query(JobRole).filter(
+        JobRole.status == "open",
+        JobRole.recruiter_owner != None,
+    ).all()
+
+    recruiter_roles: Dict[str, List[JobRole]] = {}
+    for role in roles:
+        recruiter_roles.setdefault(role.recruiter_owner, []).append(role)
+
+    result = []
+    for recruiter, assigned in recruiter_roles.items():
+        if len(assigned) >= OVERLOAD_THRESHOLD:
+            result.append({
+                "severity": "medium",
+                "category": "recruiter_overload",
+                "title": f"{recruiter} is assigned to {len(assigned)} open roles",
+                "explanation": (
+                    f"Recruiter {recruiter} is the owner of {len(assigned)} simultaneously open roles. "
+                    f"Threshold is {OVERLOAD_THRESHOLD}. Overloaded recruiters typically produce slower "
+                    "time-to-fill and lower submission rates."
+                ),
+                "recommended_fix": (
+                    f"Consider redistributing some of {recruiter}'s roles to other recruiters "
+                    "or escalating additional headcount to support their workload."
+                ),
+                "related_entity_type": "job_role",
+                "related_entity_id": assigned[0].id,
+                "status": "open",
+            })
+    return result
+
+
+def _check_rejected_without_reason(db: Session) -> List[Dict[str, Any]]:
+    """Rule 12: Candidates rejected after interview with no rejection reason on record."""
+    apps = db.query(Application).filter(
+        Application.canonical_stage == "rejected",
+        Application.rejection_reason == None,
+        Application.status == "active",
+    ).all()
+
+    # Only flag rejections that happened after the interview stage (infer from raw_stage)
+    POST_INTERVIEW_KEYWORDS = ["interview", "client", "offer", "final"]
+
+    result = []
+    for app in apps:
+        raw = (app.raw_stage or "").lower()
+        is_late_rejection = any(kw in raw for kw in POST_INTERVIEW_KEYWORDS)
+        if not is_late_rejection:
+            continue
+        name = app.candidate.full_name if app.candidate else "Unknown"
+        title = app.job_role.title if app.job_role else "Unknown Role"
+        result.append({
+            "severity": "low",
+            "category": "rejection_no_reason",
+            "title": f"{name} rejected from {title} with no rejection reason",
+            "explanation": (
+                f"{name} was rejected from '{title}' after reaching interview stage "
+                "but no rejection reason is recorded. This reduces pattern visibility "
+                "for future sourcing and blocks meaningful reporting."
+            ),
+            "recommended_fix": "Add a rejection reason (e.g., overqualified, culture fit, compensation) to this application.",
+            "related_entity_type": "application",
+            "related_entity_id": app.id,
+            "status": "open",
+        })
     return result
 
 
