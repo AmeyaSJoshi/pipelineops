@@ -9,16 +9,18 @@ from app.services.normalization import hash_email, hash_phone, mask_email, mask_
 
 def seed_demo_data(db: Session) -> dict:
     # Source accounts
+    # Blocked sources have no official public API — see CONNECTOR_AUDIT.md.
+    # Live sources show needs_credentials until real API keys are set.
     sources = [
-        SourceAccount(source_type="indeed",        display_name="Indeed (Demo)",        status="demo",              records_total=0),
-        SourceAccount(source_type="careerbuilder", display_name="CareerBuilder (Demo)", status="demo",              records_total=0),
-        SourceAccount(source_type="monster",       display_name="Monster (Demo)",       status="demo",              records_total=0),
-        SourceAccount(source_type="dice",          display_name="Dice (Demo)",          status="demo",              records_total=0),
-        SourceAccount(source_type="greenhouse",    display_name="Greenhouse (Demo)",    status="demo",              records_total=0),
-        SourceAccount(source_type="lever",         display_name="Lever (Demo)",         status="demo",              records_total=0),
-        SourceAccount(source_type="bullhorn",      display_name="Bullhorn (Demo)",      status="demo",              records_total=0),
-        SourceAccount(source_type="csv",           display_name="CSV Upload",           status="needs_credentials", records_total=0),
-        SourceAccount(source_type="google_sheets", display_name="Google Sheets",        status="needs_credentials", records_total=0),
+        SourceAccount(source_type="indeed",        display_name="Indeed",        status="blocked",           records_total=0),
+        SourceAccount(source_type="careerbuilder", display_name="CareerBuilder", status="blocked",           records_total=0),
+        SourceAccount(source_type="monster",       display_name="Monster",       status="blocked",           records_total=0),
+        SourceAccount(source_type="dice",          display_name="Dice",          status="blocked",           records_total=0),
+        SourceAccount(source_type="greenhouse",    display_name="Greenhouse",    status="needs_credentials", records_total=0),
+        SourceAccount(source_type="lever",         display_name="Lever",         status="needs_credentials", records_total=0),
+        SourceAccount(source_type="bullhorn",      display_name="Bullhorn",      status="needs_credentials", records_total=0),
+        SourceAccount(source_type="csv",           display_name="CSV / Excel",   status="ready",             records_total=0),
+        SourceAccount(source_type="google_sheets", display_name="Google Sheets", status="needs_credentials", records_total=0),
     ]
     for s in sources:
         db.add(s)

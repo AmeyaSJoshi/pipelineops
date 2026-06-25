@@ -23,14 +23,37 @@ export const api = {
   reportAnomalies: () => req<any>("/reports/anomalies"),
   updateAnomaly: (id: number, status: string) =>
     req<any>(`/reports/anomalies/${id}`, { method: "PATCH", body: JSON.stringify({ status }) }),
-  candidates: () => req<any>("/candidates"),
+  candidates: (params?: { limit?: number; stage?: string }) => {
+    const qs = params ? "?" + new URLSearchParams(Object.entries(params).filter(([, v]) => v != null) as string[][]).toString() : "";
+    return req<any>(`/candidates${qs}`);
+  },
+  candidate: (id: number) => req<any>(`/candidates/${id}`),
   duplicates: () => req<any>("/candidates/duplicates"),
   mergeCandidates: (primaryId: number, secondaryId: number) =>
     req<any>(`/candidates/merge?primary_id=${primaryId}&secondary_id=${secondaryId}`, { method: "POST" }),
+  roles: () => req<any>("/roles"),
+  roleCandidates: (roleId: number) => req<any>(`/roles/${roleId}/candidates`),
   chat: (message: string, history?: any[]) =>
     req<any>("/agent/chat", { method: "POST", body: JSON.stringify({ message, conversation_history: history || [] }) }),
   exportSheets: (format = "csv") =>
     req<any>("/sheets/export", { method: "POST", body: JSON.stringify({ format }) }),
   gmiSettings: () => req<any>("/settings/gmi"),
-  syncDemo: (source: string) => req<any>(`/sync/demo/${source}`, { method: "POST" }),
+  connectorSettings: () => req<any>("/settings/connectors"),
+  connectors: () => req<any>("/connectors"),
+  connectorStatus: (source: string) => req<any>(`/connectors/${source}/status`),
+  syncConnector: (source: string) =>
+    req<any>(`/connectors/${source}/sync`, { method: "POST" }),
+  onboardingStatus: () => req<any>("/onboarding/status"),
+  draftAction: (body: { action_type: string; candidate_id?: number; context?: any }) =>
+    req<any>("/actions/draft", { method: "POST", body: JSON.stringify(body) }),
+  uploadFile: async (file: File, confirmImport = false): Promise<any> => {
+    const form = new FormData();
+    form.append("file", file);
+    const res = await fetch(`${BASE}/sync/file?confirm_import=${confirmImport}`, {
+      method: "POST",
+      body: form,
+    });
+    if (!res.ok) throw new Error(`Upload error ${res.status}`);
+    return res.json();
+  },
 };
