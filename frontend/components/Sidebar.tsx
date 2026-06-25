@@ -3,12 +3,13 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
   LayoutDashboard, Database, Users, AlertTriangle,
-  FileText, MessageSquare, Settings, Zap, BookOpen
+  FileText, MessageSquare, Settings, Zap, BookOpen, Briefcase
 } from "lucide-react";
 
 const nav = [
   { href: "/",          label: "Dashboard",  icon: LayoutDashboard },
   { href: "/sources",   label: "Sources",    icon: Database },
+  { href: "/roles",     label: "Roles",      icon: Briefcase },
   { href: "/candidates",label: "Candidates", icon: Users },
   { href: "/anomalies", label: "Anomalies",  icon: AlertTriangle },
   { href: "/reports",   label: "Reports",    icon: FileText },

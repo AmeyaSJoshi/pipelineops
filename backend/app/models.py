@@ -40,6 +40,7 @@ class SourceAccount(Base):
     credentials_encrypted = Column(Text, nullable=True)  # placeholder for encrypted creds
     last_sync_at = Column(DateTime, nullable=True)
     records_total = Column(Integer, default=0)
+    org_id = Column(Integer, ForeignKey("organizations.id"), nullable=True, index=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

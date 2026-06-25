@@ -27,9 +27,18 @@ from app.services.llm import generate_report, answer_chat_question
 from app.services.exports import generate_csv_export, generate_sheet_preview
 from app.services.sheets import export_to_google_sheets
 from app.services.audit import log_action
-from app.auth import router as auth_router
+from app.auth import router as auth_router, get_current_user
+from app.models import User as UserModel
 
 settings = get_settings()
+
+
+def _apply_org_filter(q, user: Optional[UserModel]):
+    """Apply org_id scoping to any SourceAccount query when the user is org-scoped."""
+    if user and user.org_id is not None:
+        q = q.filter(SourceAccount.org_id == user.org_id)
+    return q
+
 
 app = FastAPI(
     title="PipelineOps Agent API",
@@ -170,6 +179,7 @@ async def sync_live_connector(
     source_type: str,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
+    user: Optional[UserModel] = Depends(get_current_user),
 ):
     """Trigger a live sync from Greenhouse, Lever, or Bullhorn."""
     if source_type in BLOCKED_SOURCES:
@@ -179,12 +189,13 @@ async def sync_live_connector(
     if source_type not in LIVE_SOURCES:
         raise HTTPException(400, f"'{source_type}' is not a syncable live source.")
 
-    job = create_job(f"sync_{source_type}", {"source_type": source_type})
-    background_tasks.add_task(_sync_source_job, job["job_id"], source_type)
+    org_id = user.org_id if user else None
+    job = create_job(f"sync_{source_type}", {"source_type": source_type, "org_id": org_id})
+    background_tasks.add_task(_sync_source_job, job["job_id"], source_type, org_id)
     return JobResponse(**job)
 
 
-async def _sync_source_job(job_id: str, source_type: str):
+async def _sync_source_job(job_id: str, source_type: str, org_id: Optional[int] = None):
     from app.db import SessionLocal
     db = SessionLocal()
     try:
@@ -201,12 +212,16 @@ async def _sync_source_job(job_id: str, source_type: str):
         update_job(job_id, progress=0.5, result={"step": "Fetching applications"})
         applications = connector.fetch_applications()
 
-        source = db.query(SourceAccount).filter(SourceAccount.source_type == source_type).first()
+        q = db.query(SourceAccount).filter(SourceAccount.source_type == source_type)
+        if org_id is not None:
+            q = q.filter(SourceAccount.org_id == org_id)
+        source = q.first()
         if not source:
             source = SourceAccount(
                 source_type=source_type,
                 display_name=source_type.title(),
                 status="connected",
+                org_id=org_id,
             )
             db.add(source)
             db.flush()
@@ -308,6 +323,7 @@ async def sync_file(
     file: UploadFile = File(...),
     confirm_import: bool = Query(False, description="Set true to actually import; false returns preview only"),
     db: Session = Depends(get_db),
+    user: Optional[UserModel] = Depends(get_current_user),
 ):
     """Upload a CSV or Excel (.xlsx) file to import candidates/jobs."""
     from app.connectors.csv_connector import CSVConnector
@@ -343,16 +359,21 @@ async def sync_file(
             "preview": preview,
         }
 
-    # Confirmed import — find or create a CSV source account
-    source = db.query(SourceAccount).filter(
+    # Confirmed import — find or create a CSV source account, scoped to org when authenticated
+    org_id = user.org_id if user else None
+    q = db.query(SourceAccount).filter(
         SourceAccount.source_type == "csv",
         SourceAccount.display_name == filename,
-    ).first()
+    )
+    if org_id is not None:
+        q = q.filter(SourceAccount.org_id == org_id)
+    source = q.first()
     if not source:
         source = SourceAccount(
             source_type="csv",
             display_name=filename,
             status="connected",
+            org_id=org_id,
         )
         db.add(source)
         db.flush()
@@ -536,12 +557,15 @@ async def _sync_all_live(job_id: str, db: Session) -> Dict[str, Any]:
 # ──────────────────────────────────────────────────────────────────────────────
 
 @app.get("/onboarding/status", tags=["Onboarding"])
-def onboarding_status(db: Session = Depends(get_db)):
+def onboarding_status(
+    db: Session = Depends(get_db),
+    user: Optional[UserModel] = Depends(get_current_user),
+):
     """
     Return whether the instance has been set up.
     Checks: at least one source account exists, at least one connector configured.
     """
-    sources = db.query(SourceAccount).all()
+    sources = _apply_org_filter(db.query(SourceAccount), user).all()
     has_sources = len(sources) > 0
     has_live_connector = settings.greenhouse_configured() or settings.lever_configured() or settings.bullhorn_configured()
     has_file_connector = any(s.source_type == "csv" for s in sources)
@@ -893,14 +917,18 @@ def agent_chat(request: ChatRequest, db: Session = Depends(get_db)):
 # ──────────────────────────────────────────────────────────────────────────────
 
 @app.get("/sources", tags=["General"])
-def list_sources(db: Session = Depends(get_db)):
-    sources = db.query(SourceAccount).all()
+def list_sources(
+    db: Session = Depends(get_db),
+    user: Optional[UserModel] = Depends(get_current_user),
+):
+    sources = _apply_org_filter(db.query(SourceAccount), user).all()
     return {
         "sources": [
             {
                 "id": s.id, "source_type": s.source_type, "display_name": s.display_name,
                 "status": s.status, "last_sync_at": s.last_sync_at.isoformat() if s.last_sync_at else None,
                 "records_total": s.records_total,
+                "org_id": s.org_id,
             }
             for s in sources
         ]
