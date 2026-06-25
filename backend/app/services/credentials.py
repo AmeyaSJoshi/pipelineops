@@ -95,19 +95,26 @@ CONNECTOR_FIELDS = {
     ],
     "google_sheets": [
         {
+            "key": "oauth_client_id",
+            "label": "OAuth Client ID",
+            "type": "text",
+            "placeholder": "123456789-abc.apps.googleusercontent.com",
+            "help": "Google Cloud Console → APIs & Services → Credentials → Create OAuth 2.0 Client ID (Web application). Add http://localhost:8080/connectors/google_sheets/oauth/callback as an authorized redirect URI.",
+            "docs_url": "https://console.cloud.google.com/apis/credentials",
+        },
+        {
+            "key": "oauth_client_secret",
+            "label": "OAuth Client Secret",
+            "type": "password",
+            "placeholder": "GOCSPX-…",
+            "help": "Shown on the same credentials page as the Client ID.",
+        },
+        {
             "key": "spreadsheet_id",
             "label": "Spreadsheet ID",
             "type": "text",
             "placeholder": "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms",
-            "help": "The long ID in your Google Sheets URL: docs.google.com/spreadsheets/d/[THIS_PART]/edit",
-        },
-        {
-            "key": "credentials_json",
-            "label": "Service Account JSON",
-            "type": "textarea",
-            "placeholder": '{"type": "service_account", "project_id": "...", ...}',
-            "help": "Google Cloud Console → IAM → Service Accounts → Keys → Add Key (JSON). Share the spreadsheet with the service account email.",
-            "docs_url": "https://developers.google.com/workspace/guides/create-credentials#service-account",
+            "help": "The ID from your Google Sheets URL: docs.google.com/spreadsheets/d/[THIS_PART]/edit",
         },
     ],
 }

@@ -46,6 +46,7 @@ export const api = {
     req<any>(`/connectors/${source}/credentials`, { method: "POST", body: JSON.stringify(creds) }),
   deleteCredentials: (source: string) =>
     req<any>(`/connectors/${source}/credentials`, { method: "DELETE" }),
+  googleOAuthUrl: () => req<any>("/connectors/google_sheets/oauth/url"),
   syncConnector: (source: string) =>
     req<any>(`/connectors/${source}/sync`, { method: "POST" }),
   onboardingStatus: () => req<any>("/onboarding/status"),

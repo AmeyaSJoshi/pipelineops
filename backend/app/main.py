@@ -317,6 +317,103 @@ def delete_connector_credentials(
     return {"source_type": source_type, "cleared": True}
 
 
+# ── Google OAuth flow ─────────────────────────────────────────────────────────
+
+GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GOOGLE_SCOPES = "https://www.googleapis.com/auth/spreadsheets"
+
+
+def _google_redirect_uri() -> str:
+    base = settings.FRONTEND_API_BASE_URL.rstrip("/")
+    # redirect URI must point to the backend, not the frontend
+    return "http://localhost:8080/connectors/google_sheets/oauth/callback"
+
+
+@app.get("/connectors/google_sheets/oauth/url", tags=["Connectors"])
+def google_oauth_url(db: Session = Depends(get_db)):
+    """
+    Return the Google OAuth authorization URL.
+    The frontend redirects the user here; after auth Google posts back to /oauth/callback.
+    Requires google_sheets credentials to have been saved first (to get client_id/client_secret).
+    """
+    import urllib.parse
+    from app.services.credentials import decrypt
+
+    src = db.query(SourceAccount).filter(SourceAccount.source_type == "google_sheets").first()
+    if not src or not src.credentials_encrypted:
+        raise HTTPException(400, "Save Google OAuth credentials first (Client ID + Client Secret + Spreadsheet ID).")
+
+    creds = decrypt(src.credentials_encrypted)
+    client_id = creds.get("oauth_client_id", "")
+    if not client_id:
+        raise HTTPException(400, "oauth_client_id not found in stored credentials.")
+
+    params = {
+        "client_id": client_id,
+        "redirect_uri": _google_redirect_uri(),
+        "response_type": "code",
+        "scope": GOOGLE_SCOPES,
+        "access_type": "offline",
+        "prompt": "consent",
+    }
+    url = GOOGLE_AUTH_URL + "?" + urllib.parse.urlencode(params)
+    return {"url": url}
+
+
+@app.get("/connectors/google_sheets/oauth/callback", tags=["Connectors"])
+def google_oauth_callback(code: str, db: Session = Depends(get_db), error: str = ""):
+    """
+    Google redirects here after the user authorizes.
+    Exchanges the authorization code for access + refresh tokens, stores encrypted.
+    Then redirects the browser back to the frontend sources page.
+    """
+    from fastapi.responses import RedirectResponse
+    import httpx
+    from app.services.credentials import decrypt, encrypt
+
+    frontend_url = "http://localhost:3000/sources"
+
+    if error:
+        return RedirectResponse(f"{frontend_url}?oauth_error={error}")
+
+    src = db.query(SourceAccount).filter(SourceAccount.source_type == "google_sheets").first()
+    if not src or not src.credentials_encrypted:
+        return RedirectResponse(f"{frontend_url}?oauth_error=no_credentials_saved")
+
+    stored = decrypt(src.credentials_encrypted)
+    client_id = stored.get("oauth_client_id", "")
+    client_secret = stored.get("oauth_client_secret", "")
+
+    try:
+        resp = httpx.post(GOOGLE_TOKEN_URL, data={
+            "code": code,
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "redirect_uri": _google_redirect_uri(),
+            "grant_type": "authorization_code",
+        }, timeout=15)
+        resp.raise_for_status()
+        tokens = resp.json()
+    except Exception as e:
+        return RedirectResponse(f"{frontend_url}?oauth_error={str(e)[:100]}")
+
+    # Merge tokens into stored credentials (keep spreadsheet_id etc.)
+    from datetime import timedelta
+    import time
+    stored["access_token"] = tokens["access_token"]
+    stored["refresh_token"] = tokens.get("refresh_token", stored.get("refresh_token", ""))
+    stored["token_expiry"] = time.time() + tokens.get("expires_in", 3600)
+    stored["oauth_connected"] = True
+
+    src.credentials_encrypted = encrypt(stored)
+    src.status = "connected"
+    db.commit()
+
+    log_action(db, "user", "google_oauth_connected", "source_account", src.id)
+    return RedirectResponse(f"{frontend_url}?connected=google_sheets")
+
+
 @app.post("/connectors/{source_type}/sync", tags=["Connectors"])
 async def sync_live_connector(
     source_type: str,
