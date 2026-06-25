@@ -92,7 +92,7 @@ def health(db: Session = Depends(get_db)):
 # ──────────────────────────────────────────────────────────────────────────────
 
 BLOCKED_SOURCES = {"indeed", "careerbuilder", "monster", "dice"}
-LIVE_SOURCES = {"greenhouse", "lever", "bullhorn"}
+LIVE_SOURCES = {"greenhouse", "lever", "bullhorn", "google_sheets"}
 
 CONNECTOR_WORKAROUNDS = {
     "indeed": "Export candidates as CSV from Indeed Employer dashboard, then upload via /sync/file.",
@@ -102,20 +102,48 @@ CONNECTOR_WORKAROUNDS = {
 }
 
 
-def _build_connector(source_type: str):
-    """Instantiate the correct connector class with credentials from settings."""
+def _load_db_creds(source_type: str) -> Optional[dict]:
+    """Load decrypted credentials from SourceAccount.credentials_encrypted, if stored."""
+    from app.db import SessionLocal
+    from app.services.credentials import decrypt
+    db = SessionLocal()
+    try:
+        src = db.query(SourceAccount).filter(SourceAccount.source_type == source_type).first()
+        if src and src.credentials_encrypted:
+            return decrypt(src.credentials_encrypted)
+    except Exception:
+        pass
+    finally:
+        db.close()
+    return None
+
+
+def _build_connector(source_type: str, creds: Optional[dict] = None):
+    """Instantiate the connector using DB-stored creds, or explicit creds, or env vars."""
     from app.connectors import GreenhouseConnector, LeverConnector, BullhornConnector
     from app.connectors import IndeedConnector, CareerBuilderConnector, MonsterConnector, DiceConnector
+    from app.connectors.google_sheets_connector import GoogleSheetsConnector
+
+    if creds is None:
+        creds = _load_db_creds(source_type) or {}
+
+    def _v(key: str, env_fallback: str = "") -> str:
+        return creds.get(key) or env_fallback
 
     mapping = {
-        "greenhouse": lambda: GreenhouseConnector(api_key=settings.GREENHOUSE_API_KEY),
-        "lever": lambda: LeverConnector(api_key=settings.LEVER_API_KEY),
-        "bullhorn": lambda: BullhornConnector(
-            client_id=settings.BULLHORN_CLIENT_ID,
-            client_secret=settings.BULLHORN_CLIENT_SECRET,
-            username=settings.BULLHORN_USERNAME,
-            password=settings.BULLHORN_PASSWORD,
+        "greenhouse": lambda: GreenhouseConnector(
+            api_key=_v("api_key", settings.GREENHOUSE_API_KEY)
         ),
+        "lever": lambda: LeverConnector(
+            api_key=_v("api_key", settings.LEVER_API_KEY)
+        ),
+        "bullhorn": lambda: BullhornConnector(
+            client_id=_v("client_id", settings.BULLHORN_CLIENT_ID),
+            client_secret=_v("client_secret", settings.BULLHORN_CLIENT_SECRET),
+            username=_v("username", settings.BULLHORN_USERNAME),
+            password=_v("password", settings.BULLHORN_PASSWORD),
+        ),
+        "google_sheets": lambda: GoogleSheetsConnector(),
         "indeed": lambda: IndeedConnector(),
         "careerbuilder": lambda: CareerBuilderConnector(),
         "monster": lambda: MonsterConnector(),
@@ -128,32 +156,48 @@ def _build_connector(source_type: str):
 
 
 @app.get("/connectors", tags=["Connectors"])
-def list_connectors():
+def list_connectors(db: Session = Depends(get_db)):
     """Return status of all connector types — what's live, what's blocked, what needs creds."""
+    # Check DB for stored credentials (overrides env-var-only status)
+    db_sources = {s.source_type: s for s in db.query(SourceAccount).all()}
+
+    def _status(source_type: str, env_configured: bool) -> str:
+        src = db_sources.get(source_type)
+        if src:
+            return src.status  # connected / error / needs_credentials from last credential save
+        return "ready" if env_configured else "needs_credentials"
+
+    def _has_creds(source_type: str, env_configured: bool) -> bool:
+        src = db_sources.get(source_type)
+        if src and src.credentials_encrypted:
+            return True
+        return env_configured
+
     return {
         "live": {
             "greenhouse": {
-                "configured": settings.greenhouse_configured(),
-                "status": "ready" if settings.greenhouse_configured() else "needs_credentials",
-                "env_var": "GREENHOUSE_API_KEY",
+                "configured": _has_creds("greenhouse", settings.greenhouse_configured()),
+                "status": _status("greenhouse", settings.greenhouse_configured()),
                 "docs": "https://developers.greenhouse.io/harvest",
             },
             "lever": {
-                "configured": settings.lever_configured(),
-                "status": "ready" if settings.lever_configured() else "needs_credentials",
-                "env_var": "LEVER_API_KEY",
+                "configured": _has_creds("lever", settings.lever_configured()),
+                "status": _status("lever", settings.lever_configured()),
                 "docs": "https://hire.lever.co/developer/documentation",
             },
             "bullhorn": {
-                "configured": settings.bullhorn_configured(),
-                "status": "ready" if settings.bullhorn_configured() else "needs_credentials",
-                "env_vars": ["BULLHORN_CLIENT_ID", "BULLHORN_CLIENT_SECRET", "BULLHORN_USERNAME", "BULLHORN_PASSWORD"],
+                "configured": _has_creds("bullhorn", settings.bullhorn_configured()),
+                "status": _status("bullhorn", settings.bullhorn_configured()),
                 "docs": "https://bullhorn.github.io/rest-api-docs",
+            },
+            "google_sheets": {
+                "configured": _has_creds("google_sheets", settings.google_sheets_configured()),
+                "status": _status("google_sheets", settings.google_sheets_configured()),
+                "docs": "https://developers.google.com/workspace/guides/create-credentials#service-account",
             },
         },
         "file": {
-            "csv": {"status": "ready", "formats": ["csv"], "endpoint": "/sync/file"},
-            "excel": {"status": "ready", "formats": ["xlsx"], "endpoint": "/sync/file"},
+            "csv": {"status": "ready", "formats": ["csv", "xlsx"], "endpoint": "/sync/file"},
         },
         "blocked": {
             src: {
@@ -172,6 +216,105 @@ def connector_status(source_type: str):
     connector = _build_connector(source_type)
     result = connector.test_connection()
     return {"source": source_type, **result}
+
+
+@app.get("/connectors/{source_type}/fields", tags=["Connectors"])
+def connector_fields(source_type: str):
+    """Return the field definitions needed to configure this connector."""
+    from app.services.credentials import CONNECTOR_FIELDS
+    fields = CONNECTOR_FIELDS.get(source_type)
+    if not fields:
+        raise HTTPException(404, f"No credential fields defined for '{source_type}'.")
+    # Return fields without exposing stored values
+    return {"source_type": source_type, "fields": fields}
+
+
+@app.post("/connectors/{source_type}/credentials", tags=["Connectors"])
+def save_connector_credentials(
+    source_type: str,
+    body: Dict[str, Any],
+    db: Session = Depends(get_db),
+    user: Optional[UserModel] = Depends(get_current_user),
+):
+    """
+    Save encrypted credentials for a connector, then immediately test the connection.
+    Returns {success, message, status} so the UI can unlock Sync Now on success.
+    """
+    from app.services.credentials import encrypt, CONNECTOR_FIELDS, required_keys
+
+    if source_type not in LIVE_SOURCES:
+        raise HTTPException(400, f"'{source_type}' does not support credential storage.")
+
+    # Validate all required fields are present and non-empty
+    missing = [k for k in required_keys(source_type) if not body.get(k, "").strip()]
+    if missing:
+        raise HTTPException(422, f"Missing required fields: {', '.join(missing)}")
+
+    # Encrypt and upsert SourceAccount
+    encrypted = encrypt({k: body[k] for k in required_keys(source_type)})
+    org_id = user.org_id if user else None
+
+    q = db.query(SourceAccount).filter(SourceAccount.source_type == source_type)
+    if org_id is not None:
+        q = q.filter(SourceAccount.org_id == org_id)
+    src = q.first()
+
+    if not src:
+        meta = {
+            "greenhouse": "Greenhouse",
+            "lever": "Lever",
+            "bullhorn": "Bullhorn",
+            "google_sheets": "Google Sheets",
+        }
+        src = SourceAccount(
+            source_type=source_type,
+            display_name=meta.get(source_type, source_type.title()),
+            status="needs_credentials",
+            org_id=org_id,
+        )
+        db.add(src)
+        db.flush()
+
+    src.credentials_encrypted = encrypted
+
+    # Test connection with the newly provided credentials
+    try:
+        connector = _build_connector(source_type, creds={k: body[k] for k in required_keys(source_type)})
+        test = connector.test_connection()
+    except Exception as e:
+        test = {"success": False, "message": str(e)}
+
+    src.status = "connected" if test.get("success") else "error"
+    db.commit()
+
+    log_action(db, "user", f"save_credentials_{source_type}", "source_account", src.id,
+               after_json={"status": src.status})
+
+    return {
+        "source_type": source_type,
+        "saved": True,
+        "connection_test": test,
+        "status": src.status,
+    }
+
+
+@app.delete("/connectors/{source_type}/credentials", tags=["Connectors"])
+def delete_connector_credentials(
+    source_type: str,
+    db: Session = Depends(get_db),
+    user: Optional[UserModel] = Depends(get_current_user),
+):
+    """Remove stored credentials for a connector."""
+    org_id = user.org_id if user else None
+    q = db.query(SourceAccount).filter(SourceAccount.source_type == source_type)
+    if org_id is not None:
+        q = q.filter(SourceAccount.org_id == org_id)
+    src = q.first()
+    if src:
+        src.credentials_encrypted = None
+        src.status = "needs_credentials"
+        db.commit()
+    return {"source_type": source_type, "cleared": True}
 
 
 @app.post("/connectors/{source_type}/sync", tags=["Connectors"])

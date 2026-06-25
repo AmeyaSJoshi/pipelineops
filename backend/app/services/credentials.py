@@ -1,0 +1,117 @@
+"""
+Encrypt/decrypt connector credentials stored in SourceAccount.credentials_encrypted.
+Uses Fernet (AES-128-CBC + HMAC) from the cryptography package.
+ENCRYPTION_KEY must be set in production. Dev falls back to a stable derived key.
+"""
+import base64
+import hashlib
+import json
+
+from cryptography.fernet import Fernet, InvalidToken
+
+from app.config import get_settings
+
+
+def _fernet() -> Fernet:
+    settings = get_settings()
+    key = (settings.ENCRYPTION_KEY or "").strip()
+    if key:
+        # Accept either a raw 32-byte base64url Fernet key, or any string we derive from
+        try:
+            return Fernet(key.encode())
+        except Exception:
+            pass
+        # Derive a valid 32-byte Fernet key from whatever string was provided
+        derived = base64.urlsafe_b64encode(hashlib.sha256(key.encode()).digest())
+        return Fernet(derived)
+    # Dev-only stable fallback (NOT secure — warn loudly)
+    import warnings
+    warnings.warn("ENCRYPTION_KEY not set — using insecure dev key. Set ENCRYPTION_KEY in production.")
+    dev_key = base64.urlsafe_b64encode(hashlib.sha256(b"dev-pipelineops-insecure").digest())
+    return Fernet(dev_key)
+
+
+def encrypt(data: dict) -> str:
+    return _fernet().encrypt(json.dumps(data).encode()).decode()
+
+
+def decrypt(encrypted: str) -> dict:
+    try:
+        return json.loads(_fernet().decrypt(encrypted.encode()))
+    except (InvalidToken, Exception) as e:
+        raise ValueError(f"Failed to decrypt credentials: {e}")
+
+
+# ── Field definitions per connector type ──────────────────────────────────────
+
+CONNECTOR_FIELDS = {
+    "greenhouse": [
+        {
+            "key": "api_key",
+            "label": "Harvest API Key",
+            "type": "password",
+            "placeholder": "Your Greenhouse Harvest API key",
+            "help": "Greenhouse → Settings → Dev Center → API Credential Management → Create New Credential (Harvest API key)",
+            "docs_url": "https://developers.greenhouse.io/harvest",
+        },
+    ],
+    "lever": [
+        {
+            "key": "api_key",
+            "label": "API Key",
+            "type": "password",
+            "placeholder": "Your Lever API key",
+            "help": "Lever → Settings → Integrations & API → API Credentials → Generate New Key",
+            "docs_url": "https://hire.lever.co/developer/documentation",
+        },
+    ],
+    "bullhorn": [
+        {
+            "key": "client_id",
+            "label": "Client ID",
+            "type": "text",
+            "placeholder": "bullhorn_client_id",
+            "help": "Provided by Bullhorn during API onboarding. Contact support@bullhorn.com.",
+        },
+        {
+            "key": "client_secret",
+            "label": "Client Secret",
+            "type": "password",
+            "placeholder": "bullhorn_client_secret",
+        },
+        {
+            "key": "username",
+            "label": "Username",
+            "type": "text",
+            "placeholder": "your@bullhorn.com",
+        },
+        {
+            "key": "password",
+            "label": "Password",
+            "type": "password",
+            "placeholder": "Bullhorn account password",
+            "help": "Password is used once for OAuth and immediately cleared. It is never stored.",
+        },
+    ],
+    "google_sheets": [
+        {
+            "key": "spreadsheet_id",
+            "label": "Spreadsheet ID",
+            "type": "text",
+            "placeholder": "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms",
+            "help": "The long ID in your Google Sheets URL: docs.google.com/spreadsheets/d/[THIS_PART]/edit",
+        },
+        {
+            "key": "credentials_json",
+            "label": "Service Account JSON",
+            "type": "textarea",
+            "placeholder": '{"type": "service_account", "project_id": "...", ...}',
+            "help": "Google Cloud Console → IAM → Service Accounts → Keys → Add Key (JSON). Share the spreadsheet with the service account email.",
+            "docs_url": "https://developers.google.com/workspace/guides/create-credentials#service-account",
+        },
+    ],
+}
+
+
+def required_keys(source_type: str) -> list[str]:
+    return [f["key"] for f in CONNECTOR_FIELDS.get(source_type, [])]

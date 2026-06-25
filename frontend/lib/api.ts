@@ -40,7 +40,12 @@ export const api = {
   gmiSettings: () => req<any>("/settings/gmi"),
   connectorSettings: () => req<any>("/settings/connectors"),
   connectors: () => req<any>("/connectors"),
+  connectorFields: (source: string) => req<any>(`/connectors/${source}/fields`),
   connectorStatus: (source: string) => req<any>(`/connectors/${source}/status`),
+  saveCredentials: (source: string, creds: Record<string, string>) =>
+    req<any>(`/connectors/${source}/credentials`, { method: "POST", body: JSON.stringify(creds) }),
+  deleteCredentials: (source: string) =>
+    req<any>(`/connectors/${source}/credentials`, { method: "DELETE" }),
   syncConnector: (source: string) =>
     req<any>(`/connectors/${source}/sync`, { method: "POST" }),
   onboardingStatus: () => req<any>("/onboarding/status"),
