@@ -27,6 +27,7 @@ from app.services.llm import generate_report, answer_chat_question
 from app.services.exports import generate_csv_export, generate_sheet_preview
 from app.services.sheets import export_to_google_sheets
 from app.services.audit import log_action
+from app.auth import router as auth_router
 
 settings = get_settings()
 
@@ -43,6 +44,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+app.include_router(auth_router)
 
 
 @app.on_event("startup")
@@ -762,6 +766,8 @@ def get_candidate(candidate_id: int, db: Session = Depends(get_db)):
             {
                 "id": a.id,
                 "job_role_id": a.job_role_id,
+                "role_title": a.job_role.title if a.job_role else None,
+                "company_name": a.job_role.company.name if (a.job_role and a.job_role.company) else None,
                 "raw_stage": a.raw_stage,
                 "canonical_stage": a.canonical_stage,
                 "status": a.status,

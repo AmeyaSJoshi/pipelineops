@@ -8,12 +8,36 @@ services:
     ports:
       - "8080:8080"
     environment:
+      # ── Database ──────────────────────────────────────────────────────────────
       - DATABASE_URL=sqlite:///./pipelineops.db
-      - ALLOW_WRITES=false
+      - ALLOW_WRITES=${ALLOW_WRITES:-false}
+
+      # ── Security ──────────────────────────────────────────────────────────────
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY:-}
+      - SECRET_KEY=${SECRET_KEY:-}
+
+      # ── GMI MaaS / AgentBox ───────────────────────────────────────────────────
       - GMI_MAAS_BASE_URL=${GMI_MAAS_BASE_URL:-}
       - GMI_MAAS_API_KEY=${GMI_MAAS_API_KEY:-}
       - GMI_SELECTED_MODEL=${GMI_SELECTED_MODEL:-}
       - GMI_MODELS=${GMI_MODELS:-}
+      - GMI_AGENTBOX_DEPLOYMENT_MODE=${GMI_AGENTBOX_DEPLOYMENT_MODE:-}
+      - GMI_AGENTBOX_LISTING_STATUS=${GMI_AGENTBOX_LISTING_STATUS:-Draft}
+
+      # ── Local LLM fallback ────────────────────────────────────────────────────
+      - LOCAL_LLM_BASE_URL=${LOCAL_LLM_BASE_URL:-}
+      - LOCAL_LLM_API_KEY=${LOCAL_LLM_API_KEY:-}
+      - LOCAL_LLM_MODEL=${LOCAL_LLM_MODEL:-}
+
+      # ── ATS Connectors ────────────────────────────────────────────────────────
+      - GREENHOUSE_API_KEY=${GREENHOUSE_API_KEY:-}
+      - LEVER_API_KEY=${LEVER_API_KEY:-}
+      - BULLHORN_CLIENT_ID=${BULLHORN_CLIENT_ID:-}
+      - BULLHORN_CLIENT_SECRET=${BULLHORN_CLIENT_SECRET:-}
+      - BULLHORN_USERNAME=${BULLHORN_USERNAME:-}
+      - BULLHORN_PASSWORD=${BULLHORN_PASSWORD:-}
+
+      # ── Google Sheets ─────────────────────────────────────────────────────────
       - GOOGLE_SHEETS_CREDENTIALS_JSON=${GOOGLE_SHEETS_CREDENTIALS_JSON:-}
       - GOOGLE_SHEETS_SPREADSHEET_ID=${GOOGLE_SHEETS_SPREADSHEET_ID:-}
     volumes:
