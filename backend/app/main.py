@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, BackgroundTasks
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
@@ -19,7 +19,7 @@ from app.schemas import (
 )
 from app.jobs import create_job, get_job, update_job
 from app.seed import seed_demo_data, reset_demo_data
-from app.services.normalization import normalize_candidate, normalize_application
+from app.services.normalization import normalize_candidate, normalize_application, normalize_job, content_hash
 from app.services.anomalies import detect_all_anomalies, save_anomalies
 from app.services.reporting import calculate_metrics, calculate_role_metrics, generate_narrative_summary, get_recommended_actions
 from app.services.reconciliation import find_duplicate_candidates, merge_candidates
@@ -75,11 +75,314 @@ def health(db: Session = Depends(get_db)):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Connectors — status and live sync
+# ──────────────────────────────────────────────────────────────────────────────
+
+BLOCKED_SOURCES = {"indeed", "careerbuilder", "monster", "dice"}
+LIVE_SOURCES = {"greenhouse", "lever", "bullhorn"}
+
+CONNECTOR_WORKAROUNDS = {
+    "indeed": "Export candidates as CSV from Indeed Employer dashboard, then upload via /sync/file.",
+    "careerbuilder": "Export candidates as CSV from CareerBuilder portal, then upload via /sync/file.",
+    "monster": "Export candidates from Monster Employer Center as CSV, then upload via /sync/file.",
+    "dice": "Export candidate profiles from Dice employer account as CSV, then upload via /sync/file.",
+}
+
+
+def _build_connector(source_type: str):
+    """Instantiate the correct connector class with credentials from settings."""
+    from app.connectors import GreenhouseConnector, LeverConnector, BullhornConnector
+    from app.connectors import IndeedConnector, CareerBuilderConnector, MonsterConnector, DiceConnector
+
+    mapping = {
+        "greenhouse": lambda: GreenhouseConnector(api_key=settings.GREENHOUSE_API_KEY),
+        "lever": lambda: LeverConnector(api_key=settings.LEVER_API_KEY),
+        "bullhorn": lambda: BullhornConnector(
+            client_id=settings.BULLHORN_CLIENT_ID,
+            client_secret=settings.BULLHORN_CLIENT_SECRET,
+            username=settings.BULLHORN_USERNAME,
+            password=settings.BULLHORN_PASSWORD,
+        ),
+        "indeed": lambda: IndeedConnector(),
+        "careerbuilder": lambda: CareerBuilderConnector(),
+        "monster": lambda: MonsterConnector(),
+        "dice": lambda: DiceConnector(),
+    }
+    factory = mapping.get(source_type)
+    if not factory:
+        raise HTTPException(404, f"Unknown source type '{source_type}'.")
+    return factory()
+
+
+@app.get("/connectors", tags=["Connectors"])
+def list_connectors():
+    """Return status of all connector types — what's live, what's blocked, what needs creds."""
+    return {
+        "live": {
+            "greenhouse": {
+                "configured": settings.greenhouse_configured(),
+                "status": "ready" if settings.greenhouse_configured() else "needs_credentials",
+                "env_var": "GREENHOUSE_API_KEY",
+                "docs": "https://developers.greenhouse.io/harvest",
+            },
+            "lever": {
+                "configured": settings.lever_configured(),
+                "status": "ready" if settings.lever_configured() else "needs_credentials",
+                "env_var": "LEVER_API_KEY",
+                "docs": "https://hire.lever.co/developer/documentation",
+            },
+            "bullhorn": {
+                "configured": settings.bullhorn_configured(),
+                "status": "ready" if settings.bullhorn_configured() else "needs_credentials",
+                "env_vars": ["BULLHORN_CLIENT_ID", "BULLHORN_CLIENT_SECRET", "BULLHORN_USERNAME", "BULLHORN_PASSWORD"],
+                "docs": "https://bullhorn.github.io/rest-api-docs",
+            },
+        },
+        "file": {
+            "csv": {"status": "ready", "formats": ["csv"], "endpoint": "/sync/file"},
+            "excel": {"status": "ready", "formats": ["xlsx"], "endpoint": "/sync/file"},
+        },
+        "blocked": {
+            src: {
+                "status": "blocked",
+                "reason": "No official public API available. See CONNECTOR_AUDIT.md.",
+                "workaround": CONNECTOR_WORKAROUNDS.get(src, ""),
+            }
+            for src in sorted(BLOCKED_SOURCES)
+        },
+    }
+
+
+@app.get("/connectors/{source_type}/status", tags=["Connectors"])
+def connector_status(source_type: str):
+    """Test a specific connector's connection and return detailed status."""
+    connector = _build_connector(source_type)
+    result = connector.test_connection()
+    return {"source": source_type, **result}
+
+
+@app.post("/connectors/{source_type}/sync", tags=["Connectors"])
+async def sync_live_connector(
+    source_type: str,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    """Trigger a live sync from Greenhouse, Lever, or Bullhorn."""
+    if source_type in BLOCKED_SOURCES:
+        connector = _build_connector(source_type)
+        return connector.test_connection()
+
+    if source_type not in LIVE_SOURCES:
+        raise HTTPException(400, f"'{source_type}' is not a syncable live source.")
+
+    job = create_job(f"sync_{source_type}", {"source_type": source_type})
+    background_tasks.add_task(_sync_source_job, job["job_id"], source_type)
+    return JobResponse(**job)
+
+
+async def _sync_source_job(job_id: str, source_type: str):
+    from app.db import SessionLocal
+    db = SessionLocal()
+    try:
+        update_job(job_id, status="running", progress=0.05)
+        connector = _build_connector(source_type)
+
+        status = connector.test_connection()
+        if not status.get("success"):
+            update_job(job_id, status="failed", error=status.get("message", "Connection failed"))
+            return
+
+        update_job(job_id, progress=0.2, result={"step": "Fetching jobs"})
+        jobs = connector.fetch_jobs()
+        update_job(job_id, progress=0.5, result={"step": "Fetching applications"})
+        applications = connector.fetch_applications()
+
+        source = db.query(SourceAccount).filter(SourceAccount.source_type == source_type).first()
+        if not source:
+            source = SourceAccount(
+                source_type=source_type,
+                display_name=source_type.title(),
+                status="connected",
+            )
+            db.add(source)
+            db.flush()
+
+        update_job(job_id, progress=0.7, result={"step": "Normalizing and storing"})
+        records = _ingest_records(db, source, jobs, applications, source_type)
+
+        source.last_sync_at = datetime.utcnow()
+        source.records_total = records
+        source.status = "connected"
+        db.commit()
+
+        log_action(db, "system", f"sync_{source_type}", after_json={"records": records})
+        update_job(job_id, status="completed", progress=1.0, result={"records_synced": records, "source": source_type})
+    except Exception as e:
+        update_job(job_id, status="failed", error=str(e))
+    finally:
+        db.close()
+
+
+def _ingest_records(db: Session, source: SourceAccount, jobs: list, applications: list, source_type: str) -> int:
+    """Store normalized jobs and applications from a live connector sync."""
+    total = 0
+
+    for rj in jobs:
+        norm = normalize_job(rj, source_type)
+        company_name = norm.get("company") or "Unknown"
+        company = db.query(Company).filter(Company.normalized_name == norm.get("normalized_company")).first()
+        if not company and company_name:
+            company = Company(
+                name=company_name,
+                normalized_name=norm.get("normalized_company", ""),
+                source_account_id=source.id,
+                external_id=norm.get("external_id"),
+            )
+            db.add(company)
+            db.flush()
+
+        if company and norm.get("external_id"):
+            existing = db.query(JobRole).filter(
+                JobRole.source_account_id == source.id,
+                JobRole.external_id == norm["external_id"],
+            ).first()
+            if not existing:
+                role = JobRole(
+                    external_id=norm["external_id"],
+                    source_account_id=source.id,
+                    company_id=company.id,
+                    title=norm["title"],
+                    normalized_title=norm.get("normalized_title"),
+                    location_city=norm.get("location_city"),
+                    location_state=norm.get("location_state"),
+                    remote_type=norm.get("remote_type", "unknown"),
+                    pay_min=norm.get("pay_min"),
+                    pay_max=norm.get("pay_max"),
+                    pay_unit=norm.get("pay_unit", "unknown"),
+                    openings_count=int(norm.get("openings_count") or 1),
+                    status=norm.get("status", "open"),
+                    recruiter_owner=norm.get("recruiter_owner"),
+                )
+                db.add(role)
+        total += 1
+
+    for ra in applications:
+        norm_cand = normalize_candidate(ra, source_type)
+        norm_app = normalize_application(ra, source_type)
+
+        candidate = None
+        if norm_cand.get("email_hash"):
+            candidate = db.query(Candidate).filter(
+                Candidate.email_hash == norm_cand["email_hash"]
+            ).first()
+        if not candidate:
+            candidate = Candidate(
+                external_id=norm_cand.get("external_id"),
+                source_account_id=source.id,
+                full_name=norm_cand["full_name"],
+                email_hash=norm_cand.get("email_hash"),
+                email_display_masked=norm_cand.get("email_display_masked"),
+                phone_hash=norm_cand.get("phone_hash"),
+                phone_display_masked=norm_cand.get("phone_display_masked"),
+                location=norm_cand.get("location"),
+                current_title=norm_cand.get("current_title"),
+            )
+            db.add(candidate)
+            db.flush()
+            total += 1
+
+    db.commit()
+    return total
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# File Upload (CSV + Excel)
+# ──────────────────────────────────────────────────────────────────────────────
+
+@app.post("/sync/file", tags=["Sync"])
+async def sync_file(
+    file: UploadFile = File(...),
+    confirm_import: bool = Query(False, description="Set true to actually import; false returns preview only"),
+    db: Session = Depends(get_db),
+):
+    """Upload a CSV or Excel (.xlsx) file to import candidates/jobs."""
+    from app.connectors.csv_connector import CSVConnector
+
+    content = await file.read()
+    filename = file.filename or "upload.csv"
+    is_excel = filename.lower().endswith((".xlsx", ".xls"))
+
+    connector = CSVConnector(content, filename)
+    status = connector.test_connection()
+    if not status.get("success"):
+        raise HTTPException(400, status["message"])
+
+    jobs = connector.fetch_jobs()
+    candidates = connector.fetch_candidates()
+    apps = connector.fetch_applications()
+
+    preview = {
+        "jobs": jobs[:5],
+        "candidates": candidates[:5],
+        "applications": apps[:5],
+    }
+
+    if not confirm_import:
+        return {
+            "filename": filename,
+            "format": "excel" if is_excel else "csv",
+            "columns": status.get("columns", []),
+            "jobs_found": len(jobs),
+            "candidates_found": len(candidates),
+            "applications_found": len(apps),
+            "message": "Preview ready. Set confirm_import=true to import.",
+            "preview": preview,
+        }
+
+    # Confirmed import — find or create a CSV source account
+    source = db.query(SourceAccount).filter(
+        SourceAccount.source_type == "csv",
+        SourceAccount.display_name == filename,
+    ).first()
+    if not source:
+        source = SourceAccount(
+            source_type="csv",
+            display_name=filename,
+            status="connected",
+        )
+        db.add(source)
+        db.flush()
+
+    records = _ingest_records(db, source, jobs, apps, "csv")
+    source.last_sync_at = datetime.utcnow()
+    source.records_total = records
+    db.commit()
+
+    log_action(db, "user", "csv_import", after_json={"filename": filename, "records": records})
+    return {
+        "filename": filename,
+        "format": "excel" if is_excel else "csv",
+        "jobs_found": len(jobs),
+        "candidates_found": len(candidates),
+        "applications_found": len(apps),
+        "records_imported": records,
+        "message": f"Imported {records} records from {filename}.",
+    }
+
+
+# Keep backwards-compat alias
+@app.post("/sync/csv", tags=["Sync"])
+async def sync_csv_legacy(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    """Deprecated — use /sync/file instead."""
+    return await sync_file(file=file, confirm_import=False, db=db)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # AgentBox Async Job Lifecycle
 # ──────────────────────────────────────────────────────────────────────────────
 
 SUPPORTED_TASKS = [
-    "sync_all_demo_sources", "normalize_import", "reconcile_candidates",
+    "sync_all_sources", "normalize_import", "reconcile_candidates",
     "detect_anomalies", "generate_manager_report", "update_sheet",
     "full_pipeline_refresh",
 ]
@@ -121,10 +424,10 @@ async def _execute_job(job_id: str, task: str, params: Dict[str, Any]):
         elif task == "reconcile_candidates":
             dupes = find_duplicate_candidates(db)
             result = {"duplicate_suggestions": len(dupes)}
-        elif task == "sync_all_demo_sources":
-            result = await _sync_all_demo(job_id, db)
+        elif task == "sync_all_sources":
+            result = await _sync_all_live(job_id, db)
         else:
-            result = {"message": f"Task '{task}' completed (stub)."}
+            result = {"message": f"Task '{task}' completed."}
         update_job(job_id, status="completed", progress=1.0, result=result)
     except Exception as e:
         update_job(job_id, status="failed", error=str(e))
@@ -133,20 +436,8 @@ async def _execute_job(job_id: str, task: str, params: Dict[str, Any]):
 
 
 async def _full_pipeline_refresh(job_id: str, db: Session) -> Dict[str, Any]:
-    steps = [
-        (10, "Ingesting records from demo sources"),
-        (25, "Normalizing jobs and candidates"),
-        (40, "Mapping pipeline stages"),
-        (55, "Reconciling duplicate candidates"),
-        (65, "Calculating metrics"),
-        (75, "Detecting anomalies"),
-        (85, "Generating manager narrative"),
-        (95, "Preparing export preview"),
-    ]
-
-    # Step 1: sync all demo sources
-    update_job(job_id, progress=0.10, result={"step": "Ingesting records"})
-    await _sync_all_demo(job_id, db)
+    update_job(job_id, progress=0.10, result={"step": "Syncing live sources"})
+    sync_result = await _sync_all_live(job_id, db)
 
     update_job(job_id, progress=0.35, result={"step": "Normalizing jobs & pay rates"})
     await asyncio.sleep(0.05)
@@ -154,36 +445,30 @@ async def _full_pipeline_refresh(job_id: str, db: Session) -> Dict[str, Any]:
     update_job(job_id, progress=0.45, result={"step": "Mapping pipeline stages"})
     await asyncio.sleep(0.05)
 
-    # Step 2: reconcile
     update_job(job_id, progress=0.55, result={"step": "Reconciling candidates"})
     dupes = find_duplicate_candidates(db)
     await asyncio.sleep(0.05)
 
-    # Step 3: metrics
     update_job(job_id, progress=0.65, result={"step": "Calculating metrics"})
     metrics = calculate_metrics(db)
     await asyncio.sleep(0.05)
 
-    # Step 4: anomalies
     update_job(job_id, progress=0.75, result={"step": "Detecting anomalies"})
     anomaly_dicts = detect_all_anomalies(db)
     save_anomalies(db, anomaly_dicts)
     metrics["anomaly_count"] = len(anomaly_dicts)
     await asyncio.sleep(0.05)
 
-    # Step 5: report
     update_job(job_id, progress=0.85, result={"step": "Generating manager report"})
     anomalies_db = db.query(Anomaly).filter(Anomaly.status == "open").all()
     summary = generate_report(metrics, anomaly_dicts)
     narrative = generate_narrative_summary(metrics, anomalies_db)
     await asyncio.sleep(0.05)
 
-    # Step 6: export preview
     update_job(job_id, progress=0.95, result={"step": "Preparing export"})
     sheet_preview = generate_sheet_preview(db)
     actions = get_recommended_actions(metrics, anomalies_db)
 
-    # Save report snapshot
     snapshot = ReportSnapshot(
         metrics_json=metrics,
         narrative_summary=summary,
@@ -202,87 +487,97 @@ async def _full_pipeline_refresh(job_id: str, db: Session) -> Dict[str, Any]:
         "duplicate_suggestions": len(dupes),
         "sheet_preview": sheet_preview,
         "recommended_actions": actions,
+        "sync": sync_result,
     }
 
 
-async def _sync_all_demo(job_id: str, db: Session) -> Dict[str, Any]:
-    from app.connectors import DEMO_CONNECTORS
-    from app.services.normalization import normalize_job, normalize_candidate, normalize_application, content_hash
-
+async def _sync_all_live(job_id: str, db: Session) -> Dict[str, Any]:
+    """
+    Attempt sync from each configured live connector.
+    Skips connectors with missing credentials (returns needs_credentials instead of failing).
+    """
     total_records = 0
-    for source_name, ConnectorClass in DEMO_CONNECTORS.items():
-        connector = ConnectorClass()
-        source = db.query(SourceAccount).filter(SourceAccount.source_type == source_name).first()
-        if not source:
+    connector_results: Dict[str, Any] = {}
+
+    for source_type in ("greenhouse", "lever", "bullhorn"):
+        connector = _build_connector(source_type)
+        status = connector.test_connection()
+        if not status.get("success"):
+            connector_results[source_type] = status.get("status", "skipped")
             continue
 
-        # Fetch and store jobs
-        raw_jobs = connector.fetch_jobs()
-        for rj in raw_jobs:
-            norm = normalize_job(rj, source_name)
-            company_name = norm.get("company") or "Unknown"
-            company = db.query(Company).filter(Company.normalized_name == norm.get("normalized_company")).first()
-            if not company:
-                company = db.query(Company).filter(Company.name == company_name).first()
-            if not company:
-                continue  # Skip — only create new roles for existing companies
+        source = db.query(SourceAccount).filter(SourceAccount.source_type == source_type).first()
+        if not source:
+            connector_results[source_type] = "no_source_account"
+            continue
 
-            existing = db.query(JobRole).filter(
-                JobRole.source_account_id == source.id,
-                JobRole.external_id == norm.get("external_id")
-            ).first()
-            if not existing and norm.get("external_id"):
-                role = JobRole(
-                    external_id=norm["external_id"],
-                    source_account_id=source.id,
-                    company_id=company.id,
-                    title=norm["title"],
-                    normalized_title=norm.get("normalized_title"),
-                    location_city=norm.get("location_city"),
-                    location_state=norm.get("location_state"),
-                    remote_type=norm.get("remote_type", "unknown"),
-                    pay_min=norm.get("pay_min"),
-                    pay_max=norm.get("pay_max"),
-                    pay_unit=norm.get("pay_unit", "unknown"),
-                    openings_count=int(norm.get("openings_count") or 1),
-                    status=norm.get("status", "open"),
-                    recruiter_owner=norm.get("recruiter_owner"),
-                )
-                db.add(role)
+        try:
+            jobs = connector.fetch_jobs()
+            applications = connector.fetch_applications()
+            records = _ingest_records(db, source, jobs, applications, source_type)
+            source.last_sync_at = datetime.utcnow()
+            source.records_total = records
+            source.status = "connected"
+            db.commit()
+            total_records += records
+            connector_results[source_type] = f"ok:{records}"
+        except Exception as e:
+            connector_results[source_type] = f"error:{e}"
 
-        # Fetch and store applications/candidates
-        raw_apps = connector.fetch_applications()
-        for ra in raw_apps:
-            norm_cand = normalize_candidate(ra, source_name)
-            norm_app = normalize_application(ra, source_name)
+    return {"records_synced": total_records, "connectors": connector_results}
 
-            # Upsert candidate by email hash
-            candidate = None
-            if norm_cand.get("email_hash"):
-                candidate = db.query(Candidate).filter(
-                    Candidate.email_hash == norm_cand["email_hash"]
-                ).first()
-            if not candidate:
-                candidate = Candidate(
-                    external_id=norm_cand.get("external_id"),
-                    source_account_id=source.id,
-                    full_name=norm_cand["full_name"],
-                    email_hash=norm_cand.get("email_hash"),
-                    email_display_masked=norm_cand.get("email_display_masked"),
-                    phone_hash=norm_cand.get("phone_hash"),
-                    phone_display_masked=norm_cand.get("phone_display_masked"),
-                    location=norm_cand.get("location"),
-                    current_title=norm_cand.get("current_title"),
-                )
-                db.add(candidate)
-                db.flush()
-            total_records += 1
 
-        source.last_sync_at = datetime.utcnow()
-        source.records_total = total_records
-        db.commit()
+# ──────────────────────────────────────────────────────────────────────────────
+# Onboarding
+# ──────────────────────────────────────────────────────────────────────────────
 
-    return {"records_synced": total_records}
+@app.get("/onboarding/status", tags=["Onboarding"])
+def onboarding_status(db: Session = Depends(get_db)):
+    """
+    Return whether the instance has been set up.
+    Checks: at least one source account exists, at least one connector configured.
+    """
+    sources = db.query(SourceAccount).all()
+    has_sources = len(sources) > 0
+    has_live_connector = settings.greenhouse_configured() or settings.lever_configured() or settings.bullhorn_configured()
+    has_file_connector = any(s.source_type == "csv" for s in sources)
+    has_candidates = db.query(Candidate).first() is not None
+
+    steps = [
+        {
+            "key": "source_connected",
+            "label": "Connect a data source",
+            "complete": has_sources,
+            "description": "Connect Greenhouse, Lever, Bullhorn, or upload a CSV/Excel file.",
+        },
+        {
+            "key": "candidates_imported",
+            "label": "Import candidate records",
+            "complete": has_candidates,
+            "description": "At least one candidate must be in the system.",
+        },
+        {
+            "key": "llm_configured",
+            "label": "Configure LLM provider",
+            "complete": settings.llm_available(),
+            "description": "Set GMI_MAAS_BASE_URL + GMI_MAAS_API_KEY (or LOCAL_LLM_*) for AI features.",
+        },
+    ]
+    complete = all(s["complete"] for s in steps)
+    return {
+        "onboarding_complete": complete,
+        "steps": steps,
+        "sources": [
+            {"id": s.id, "source_type": s.source_type, "display_name": s.display_name, "status": s.status}
+            for s in sources
+        ],
+        "connector_status": {
+            "greenhouse": "configured" if settings.greenhouse_configured() else "needs_credentials",
+            "lever": "configured" if settings.lever_configured() else "needs_credentials",
+            "bullhorn": "configured" if settings.bullhorn_configured() else "needs_credentials",
+            "google_sheets": "configured" if settings.google_sheets_configured() else "needs_credentials",
+        },
+    }
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -291,9 +586,12 @@ async def _sync_all_demo(job_id: str, db: Session) -> Dict[str, Any]:
 
 @app.post("/demo/seed", response_model=SeedResponse, tags=["Demo"])
 def demo_seed(db: Session = Depends(get_db)):
-    # Don't re-seed if already seeded
     if db.query(SourceAccount).first():
-        return SeedResponse(message="Already seeded. Use /demo/reset first.", sources_created=0, companies_created=0, roles_created=0, candidates_created=0, applications_created=0)
+        return SeedResponse(
+            message="Already seeded. Use /demo/reset first.",
+            sources_created=0, companies_created=0, roles_created=0,
+            candidates_created=0, applications_created=0,
+        )
     result = seed_demo_data(db)
     log_action(db, "user", "demo_seed", after_json=result)
     return SeedResponse(message="Demo data seeded successfully.", **result)
@@ -303,47 +601,6 @@ def demo_seed(db: Session = Depends(get_db)):
 def demo_reset(db: Session = Depends(get_db)):
     tables = reset_demo_data(db)
     return ResetResponse(message="Demo data reset. Run /demo/seed to re-populate.", tables_cleared=tables)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Sync
-# ──────────────────────────────────────────────────────────────────────────────
-
-@app.post("/sync/csv", tags=["Sync"])
-async def sync_csv(file: UploadFile = File(...), db: Session = Depends(get_db)):
-    content = await file.read()
-    csv_text = content.decode("utf-8-sig")
-    from app.connectors.csv_connector import CSVConnector
-    connector = CSVConnector(csv_text, file.filename)
-    status = connector.test_connection()
-    if not status["success"]:
-        raise HTTPException(400, status["message"])
-    jobs = connector.fetch_jobs()
-    candidates = connector.fetch_candidates()
-    apps = connector.fetch_applications()
-    return {
-        "filename": file.filename,
-        "jobs_found": len(jobs),
-        "candidates_found": len(candidates),
-        "applications_found": len(apps),
-        "message": "CSV parsed. Review and confirm to import.",
-        "preview": {"jobs": jobs[:5], "candidates": candidates[:5]},
-    }
-
-
-@app.post("/sync/demo/{source_name}", tags=["Sync"])
-def sync_demo_source(source_name: str, db: Session = Depends(get_db)):
-    from app.connectors import DEMO_CONNECTORS
-    if source_name not in DEMO_CONNECTORS:
-        raise HTTPException(404, f"Demo source '{source_name}' not found.")
-    connector = DEMO_CONNECTORS[source_name]()
-    return {
-        "source": source_name,
-        "jobs": connector.fetch_jobs(),
-        "candidates": connector.fetch_candidates(),
-        "applications": connector.fetch_applications(),
-        "status": "demo",
-    }
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -445,6 +702,164 @@ def download_csv(db: Session = Depends(get_db)):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Candidates
+# ──────────────────────────────────────────────────────────────────────────────
+
+@app.get("/candidates", tags=["Candidates"])
+def list_candidates(
+    limit: int = Query(100, le=500),
+    stage: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
+    query = db.query(Candidate).filter(Candidate.is_merged_into == None)
+    candidates = query.limit(limit).all()
+    result = []
+    for c in candidates:
+        active_apps = [a for a in c.applications if a.status == "active"]
+        latest_stage = active_apps[-1].canonical_stage if active_apps else None
+        if stage and latest_stage != stage:
+            continue
+        result.append({
+            "id": c.id, "full_name": c.full_name,
+            "email_masked": c.email_display_masked,
+            "phone_masked": c.phone_display_masked,
+            "location": c.location, "current_title": c.current_title,
+            "application_count": len(c.applications),
+            "current_stage": latest_stage,
+            "created_at": c.created_at.isoformat() if c.created_at else None,
+        })
+    return {"candidates": result, "total": len(result)}
+
+
+@app.get("/candidates/duplicates", tags=["Candidates"])
+def get_duplicate_candidates(db: Session = Depends(get_db)):
+    suggestions = find_duplicate_candidates(db)
+    return {"suggestions": suggestions, "count": len(suggestions)}
+
+
+@app.post("/candidates/merge", tags=["Candidates"])
+def merge_candidate_records(primary_id: int, secondary_id: int, db: Session = Depends(get_db)):
+    result = merge_candidates(db, primary_id, secondary_id, actor="user")
+    if not result.get("success"):
+        raise HTTPException(400, result.get("error", "Merge failed"))
+    return result
+
+
+@app.get("/candidates/{candidate_id}", tags=["Candidates"])
+def get_candidate(candidate_id: int, db: Session = Depends(get_db)):
+    c = db.query(Candidate).filter(Candidate.id == candidate_id).first()
+    if not c:
+        raise HTTPException(404, "Candidate not found")
+    return {
+        "id": c.id,
+        "full_name": c.full_name,
+        "email_masked": c.email_display_masked,
+        "phone_masked": c.phone_display_masked,
+        "location": c.location,
+        "current_title": c.current_title,
+        "current_company": c.current_company,
+        "applications": [
+            {
+                "id": a.id,
+                "job_role_id": a.job_role_id,
+                "raw_stage": a.raw_stage,
+                "canonical_stage": a.canonical_stage,
+                "status": a.status,
+                "applied_at": a.applied_at.isoformat() if a.applied_at else None,
+                "last_activity_at": a.last_activity_at.isoformat() if a.last_activity_at else None,
+                "recruiter_owner": a.recruiter_owner,
+                "source": a.source,
+            }
+            for a in c.applications
+        ],
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Roles — with candidate analysis
+# ──────────────────────────────────────────────────────────────────────────────
+
+@app.get("/roles", tags=["Roles"])
+def list_roles(db: Session = Depends(get_db)):
+    return {"roles": calculate_role_metrics(db)}
+
+
+@app.get("/roles/{role_id}/candidates", tags=["Roles"])
+def role_candidates(role_id: int, db: Session = Depends(get_db)):
+    """List candidates for a specific role, with AI analysis if LLM is available."""
+    role = db.query(JobRole).filter(JobRole.id == role_id).first()
+    if not role:
+        raise HTTPException(404, "Role not found")
+
+    apps = db.query(Application).filter(
+        Application.job_role_id == role_id,
+        Application.status == "active",
+    ).all()
+
+    candidates_data = []
+    for app in apps:
+        c = app.candidate
+        if not c:
+            continue
+        candidates_data.append({
+            "candidate_id": c.id,
+            "full_name": c.full_name,
+            "location": c.location,
+            "current_title": c.current_title,
+            "canonical_stage": app.canonical_stage,
+            "raw_stage": app.raw_stage,
+            "applied_at": app.applied_at.isoformat() if app.applied_at else None,
+            "recruiter_owner": app.recruiter_owner,
+        })
+
+    analysis = None
+    if settings.llm_available() and candidates_data:
+        from app.services.llm import analyze_candidates_for_role
+        analysis = analyze_candidates_for_role(role, candidates_data)
+
+    return {
+        "role": {
+            "id": role.id,
+            "title": role.title,
+            "openings_count": role.openings_count,
+            "status": role.status,
+            "location_city": role.location_city,
+            "location_state": role.location_state,
+            "pay_min": role.pay_min,
+            "pay_max": role.pay_max,
+            "pay_unit": role.pay_unit,
+        },
+        "candidates": candidates_data,
+        "candidate_count": len(candidates_data),
+        "analysis": analysis,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Action Drafting
+# ──────────────────────────────────────────────────────────────────────────────
+
+@app.post("/actions/draft", tags=["Actions"])
+def draft_action(request: Dict[str, Any], db: Session = Depends(get_db)):
+    """
+    Draft a recruiter action for a candidate.
+    Supported action types: advance_stage, send_update, schedule_interview, reject, make_offer
+    """
+    from app.services.actions import draft_recruiter_action
+    action_type = request.get("action_type", "send_update")
+    candidate_id = request.get("candidate_id")
+    context = request.get("context", {})
+
+    candidate = None
+    if candidate_id:
+        candidate = db.query(Candidate).filter(Candidate.id == candidate_id).first()
+
+    result = draft_recruiter_action(action_type, candidate, context, settings)
+    log_action(db, "user", "draft_action", "candidate", candidate_id, after_json={"action_type": action_type})
+    return result
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Agent Chat
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -491,38 +906,6 @@ def get_metrics(db: Session = Depends(get_db)):
     return calculate_metrics(db)
 
 
-@app.get("/candidates", tags=["Candidates"])
-def list_candidates(db: Session = Depends(get_db)):
-    candidates = db.query(Candidate).filter(Candidate.is_merged_into == None).limit(100).all()
-    result = []
-    for c in candidates:
-        active_apps = [a for a in c.applications if a.status == "active"]
-        latest_stage = active_apps[-1].canonical_stage if active_apps else None
-        result.append({
-            "id": c.id, "full_name": c.full_name,
-            "email_masked": c.email_display_masked,
-            "phone_masked": c.phone_display_masked,
-            "location": c.location, "current_title": c.current_title,
-            "application_count": len(c.applications),
-            "current_stage": latest_stage,
-        })
-    return {"candidates": result}
-
-
-@app.get("/candidates/duplicates", tags=["Candidates"])
-def get_duplicate_candidates(db: Session = Depends(get_db)):
-    suggestions = find_duplicate_candidates(db)
-    return {"suggestions": suggestions, "count": len(suggestions)}
-
-
-@app.post("/candidates/merge", tags=["Candidates"])
-def merge_candidate_records(primary_id: int, secondary_id: int, db: Session = Depends(get_db)):
-    result = merge_candidates(db, primary_id, secondary_id, actor="user")
-    if not result.get("success"):
-        raise HTTPException(400, result.get("error", "Merge failed"))
-    return result
-
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Settings / GMI
 # ──────────────────────────────────────────────────────────────────────────────
@@ -539,3 +922,15 @@ def gmi_settings():
         google_sheets_configured=settings.google_sheets_configured(),
         allow_writes=settings.ALLOW_WRITES,
     )
+
+
+@app.get("/settings/connectors", tags=["Settings"])
+def connector_settings():
+    """Return which connectors are configured (no credential values — just booleans)."""
+    return {
+        "greenhouse": {"configured": settings.greenhouse_configured()},
+        "lever": {"configured": settings.lever_configured()},
+        "bullhorn": {"configured": settings.bullhorn_configured()},
+        "google_sheets": {"configured": settings.google_sheets_configured()},
+        "gmi_maas": {"configured": settings.gmi_configured()},
+    }

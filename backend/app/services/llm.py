@@ -193,6 +193,52 @@ def _format_context_for_llm(ctx: Dict[str, Any]) -> str:
     return "\n".join(parts) if parts else "No pipeline data available."
 
 
+def analyze_candidates_for_role(role: Any, candidates: List[Dict]) -> Dict[str, Any]:
+    """
+    AI analysis of candidates for a specific role.
+    Returns pipeline health, stage distribution, and recommendations.
+    """
+    from collections import Counter
+
+    stage_counts = Counter(c.get("canonical_stage", "unknown") for c in candidates)
+    in_interview = sum(v for k, v in stage_counts.items() if "interview" in k)
+    in_offer = stage_counts.get("offer", 0)
+    placed = stage_counts.get("placed", 0)
+
+    base_analysis = {
+        "candidate_count": len(candidates),
+        "stage_breakdown": dict(stage_counts),
+        "in_interview": in_interview,
+        "in_offer": in_offer,
+        "placed": placed,
+        "pipeline_health": "healthy" if len(candidates) >= 3 and in_interview >= 1 else "thin",
+    }
+
+    if not settings.llm_available() or not candidates:
+        base_analysis["narrative"] = (
+            f"{len(candidates)} candidates in pipeline for '{role.title}'. "
+            f"{in_interview} in interview stage, {in_offer} offer(s) outstanding."
+        )
+        return base_analysis
+
+    try:
+        prompt = (
+            f"You are a recruiting AI. Analyze this candidate pipeline for the role '{role.title}'.\n"
+            f"Stage distribution: {dict(stage_counts)}\n"
+            f"Total candidates: {len(candidates)}\n"
+            f"Pay range: {role.pay_min}–{role.pay_max} {role.pay_unit or ''}\n"
+            f"Openings: {role.openings_count}\n\n"
+            "Provide a 2-3 sentence assessment: pipeline health, any bottlenecks, and one recommendation. "
+            "Be specific and actionable. Do not invent data."
+        )
+        narrative = _chat([{"role": "user", "content": prompt}], fallback="")
+        base_analysis["narrative"] = narrative
+    except Exception:
+        base_analysis["narrative"] = ""
+
+    return base_analysis
+
+
 def _deterministic_chat_response(question: str, context: Dict[str, Any]) -> str:
     q = question.lower()
     metrics = context.get("metrics", {})
