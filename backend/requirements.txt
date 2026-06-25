@@ -1,0 +1,22 @@
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+sqlalchemy==2.0.36
+pydantic==2.9.2
+pydantic-settings==2.6.1
+python-multipart==0.0.12
+openai==1.57.2
+httpx==0.27.2
+python-dotenv==1.0.1
+
+# Optional: Google Sheets export
+# google-api-python-client==2.154.0
+# google-auth==2.35.0
+# google-auth-httplib2==0.2.0
+
+# Optional: real database
+# psycopg2-binary==2.9.10
+
+# Testing
+pytest==8.3.4
+pytest-asyncio==0.24.0
+httpx==0.27.2
