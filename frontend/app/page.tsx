@@ -19,7 +19,6 @@ export default function Dashboard() {
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      await api.seed().catch(() => {});
       const summary = await api.reportSummary();
       setData(summary);
     } catch (e) {
